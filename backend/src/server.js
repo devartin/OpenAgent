@@ -1,81 +1,47 @@
 const express = require('express');
 const cors = require('cors');
 const { Ollama } = require('ollama');
+const http = require('http');
+const path = require('path');
+const fs = require('fs');
 
-const app = express();
+const { SwarmOrchestrator } = require('./orchestrator');
+const { runCommand } = require('./tools/terminal');
+
+// ─────────────────────────────────────────────────────────────
+// Configuration
+// ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
+const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://127.0.0.1:11434';
 
-// Middleware
+// Initialize Ollama client
+const ollama = new Ollama({ host: OLLAMA_HOST });
+
+// Conversation storage (in-memory for now)
+const conversations = new Map();
+
+// ─────────────────────────────────────────────────────────────
+// Set up Express app
+// ─────────────────────────────────────────────────────────────
+const app = express();
+const server = http.createServer(app);
+
 app.use(cors());
-app.use(express.json());
-
-// Ollama client (configurable URL)
-let ollamaClient = new Ollama({ host: process.env.OLLAMA_HOST || 'http://localhost:11434' });
-
-// In-memory config
-let config = {
-    ollamaHost: process.env.OLLAMA_HOST || 'http://localhost:11434',
-    defaultModel: 'qwen2.5:7b',
-    mode: 'single',
-    plannerModel: 'qwen2.5:7b',
-    workerModel: 'qwen2.5:3b'
-};
-
-// Tools
-const filesystemTool = require('./tools/filesystem');
-const terminalTool = require('./tools/terminal');
-const searchTool = require('./tools/search');
+app.use(express.json({ limit: '10mb' }));
 
 // ─────────────────────────────────────────────────────────────
-// API Routes
-// ─────────────────────────────────────────────────────────────
-
-// Health check
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok', mode: config.mode });
-});
-
-// Get/Set config
-app.get('/config', (req, res) => {
-    res.json(config);
-});
-
-app.post('/config', (req, res) => {
-    const { ollamaHost, defaultModel, mode, plannerModel, workerModel } = req.body;
-    if (ollamaHost) {
-        config.ollamaHost = ollamaHost;
-        ollamaClient = new Ollama({ host: ollamaHost });
-    }
-    if (defaultModel) config.defaultModel = defaultModel;
-    if (mode) config.mode = mode;
-    if (plannerModel) config.plannerModel = plannerModel;
-    if (workerModel) config.workerModel = workerModel;
-    res.json(config);
-});
-
-// List available Ollama models
-app.get('/models', async (req, res) => {
-    try {
-        const response = await ollamaClient.list();
-        res.json(response.models || []);
-    } catch (error) {
-        res.status(500).json({ error: 'Failed to fetch models from Ollama', details: error.message });
-    }
-});
-
-// ─────────────────────────────────────────────────────────────
-// Tool definitions for the model
+// Tool Definitions for the AI
 // ─────────────────────────────────────────────────────────────
 const TOOLS = [
     {
         type: 'function',
         function: {
             name: 'read_file',
-            description: 'Read the contents of a file at the given path',
+            description: 'Read the contents of a file from the filesystem',
             parameters: {
                 type: 'object',
                 properties: {
-                    path: { type: 'string', description: 'Absolute path to the file' }
+                    path: { type: 'string', description: 'Absolute or relative path to the file' }
                 },
                 required: ['path']
             }
@@ -85,12 +51,12 @@ const TOOLS = [
         type: 'function',
         function: {
             name: 'write_file',
-            description: 'Write content to a file at the given path. Creates the file if it does not exist.',
+            description: 'Write content to a file on the filesystem',
             parameters: {
                 type: 'object',
                 properties: {
-                    path: { type: 'string', description: 'Absolute path to the file' },
-                    content: { type: 'string', description: 'Content to write' }
+                    path: { type: 'string', description: 'Path to the file to write' },
+                    content: { type: 'string', description: 'Content to write to the file' }
                 },
                 required: ['path', 'content']
             }
@@ -99,42 +65,12 @@ const TOOLS = [
     {
         type: 'function',
         function: {
-            name: 'edit_file',
-            description: 'Edit a file by searching for specific content and replacing it. Use this for partial file edits instead of rewriting the entire file.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    path: { type: 'string', description: 'Absolute path to the file' },
-                    search_content: { type: 'string', description: 'The exact content to search for in the file' },
-                    replace_content: { type: 'string', description: 'The content to replace the search content with' }
-                },
-                required: ['path', 'search_content', 'replace_content']
-            }
-        }
-    },
-    {
-        type: 'function',
-        function: {
             name: 'list_directory',
-            description: 'List files and directories at the given path',
+            description: 'List contents of a directory',
             parameters: {
                 type: 'object',
                 properties: {
-                    path: { type: 'string', description: 'Absolute path to the directory' }
-                },
-                required: ['path']
-            }
-        }
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'create_directory',
-            description: 'Create a new directory at the given path. Creates parent directories if needed.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    path: { type: 'string', description: 'Absolute path for the new directory' }
+                    path: { type: 'string', description: 'Path to the directory to list' }
                 },
                 required: ['path']
             }
@@ -144,11 +80,12 @@ const TOOLS = [
         type: 'function',
         function: {
             name: 'run_command',
-            description: 'Execute a shell command and return the output. Use for running scripts, installing packages, git commands, etc.',
+            description: 'Execute a shell command. Use with caution.',
             parameters: {
                 type: 'object',
                 properties: {
-                    command: { type: 'string', description: 'The shell command to execute' }
+                    command: { type: 'string', description: 'The shell command to execute' },
+                    cwd: { type: 'string', description: 'Working directory for the command (optional)' }
                 },
                 required: ['command']
             }
@@ -157,237 +94,353 @@ const TOOLS = [
     {
         type: 'function',
         function: {
-            name: 'grep_search',
-            description: 'Search for text patterns in files within a directory. Returns matching lines with file paths and line numbers.',
+            name: 'search_files',
+            description: 'Search for files matching a pattern in a directory',
             parameters: {
                 type: 'object',
                 properties: {
-                    pattern: { type: 'string', description: 'The text pattern to search for' },
                     directory: { type: 'string', description: 'Directory to search in' },
-                    file_pattern: { type: 'string', description: 'Optional file pattern like *.js or *.py' },
-                    ignore_case: { type: 'boolean', description: 'Whether to ignore case in search' }
+                    pattern: { type: 'string', description: 'Glob pattern to match (e.g., "*.js")' }
                 },
-                required: ['pattern', 'directory']
-            }
-        }
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'search_web',
-            description: 'Search the web for information. Returns relevant results with titles, URLs, and snippets.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    query: { type: 'string', description: 'The search query' },
-                    num_results: { type: 'number', description: 'Number of results to return (max 10)' }
-                },
-                required: ['query']
+                required: ['directory', 'pattern']
             }
         }
     }
 ];
 
-// Execute a tool call
-async function executeTool(toolName, args) {
-    switch (toolName) {
-        case 'read_file':
-            return await filesystemTool.readFile(args.path);
-        case 'write_file':
-            return await filesystemTool.writeFile(args.path, args.content);
-        case 'edit_file':
-            return await filesystemTool.editFile(args.path, args.search_content, args.replace_content);
-        case 'list_directory':
-            return await filesystemTool.listDirectory(args.path);
-        case 'create_directory':
-            return await filesystemTool.createDirectory(args.path);
-        case 'run_command':
-            return await terminalTool.runCommand(args.command);
-        case 'grep_search':
-            return await filesystemTool.grepSearch(args.pattern, args.directory, {
-                filePattern: args.file_pattern || '*',
-                ignoreCase: args.ignore_case || false
-            });
-        case 'search_web':
-            return await searchTool.searchWeb(args.query, args.num_results || 5);
-        default:
-            return { error: `Unknown tool: ${toolName}` };
+// ─────────────────────────────────────────────────────────────
+// Tool Execution Functions
+// ─────────────────────────────────────────────────────────────
+async function executeToolCall(name, args) {
+    const startTime = Date.now();
+    let result;
+
+    try {
+        switch (name) {
+            case 'read_file': {
+                const filePath = path.resolve(args.path);
+                if (!fs.existsSync(filePath)) {
+                    result = { success: false, error: `File not found: ${filePath}` };
+                } else {
+                    const stats = fs.statSync(filePath);
+                    if (stats.size > 1024 * 1024) {
+                        result = { success: false, error: 'File too large (>1MB)' };
+                    } else {
+                        const content = fs.readFileSync(filePath, 'utf-8');
+                        result = { success: true, content, size: stats.size };
+                    }
+                }
+                break;
+            }
+
+            case 'write_file': {
+                const filePath = path.resolve(args.path);
+                const dir = path.dirname(filePath);
+                if (!fs.existsSync(dir)) {
+                    fs.mkdirSync(dir, { recursive: true });
+                }
+                fs.writeFileSync(filePath, args.content, 'utf-8');
+                result = { success: true, path: filePath, bytesWritten: args.content.length };
+                break;
+            }
+
+            case 'list_directory': {
+                const dirPath = path.resolve(args.path);
+                if (!fs.existsSync(dirPath)) {
+                    result = { success: false, error: `Directory not found: ${dirPath}` };
+                } else {
+                    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+                    const items = entries.map(entry => ({
+                        name: entry.name,
+                        type: entry.isDirectory() ? 'directory' : 'file',
+                        path: path.join(dirPath, entry.name)
+                    }));
+                    result = { success: true, path: dirPath, items };
+                }
+                break;
+            }
+
+            case 'run_command': {
+                result = await runCommand(args.command, { cwd: args.cwd });
+                break;
+            }
+
+            case 'search_files': {
+                const { directory, pattern } = args;
+                const dirPath = path.resolve(directory);
+                if (!fs.existsSync(dirPath)) {
+                    result = { success: false, error: `Directory not found: ${dirPath}` };
+                } else {
+                    // Simple glob matching
+                    const matches = [];
+                    const searchDir = (dir, depth = 0) => {
+                        if (depth > 5) return; // Limit depth
+                        const entries = fs.readdirSync(dir, { withFileTypes: true });
+                        for (const entry of entries) {
+                            const fullPath = path.join(dir, entry.name);
+                            if (entry.isDirectory() && !entry.name.startsWith('.')) {
+                                searchDir(fullPath, depth + 1);
+                            } else if (entry.isFile()) {
+                                // Simple pattern matching
+                                const regex = new RegExp(pattern.replace(/\*/g, '.*').replace(/\?/g, '.'));
+                                if (regex.test(entry.name)) {
+                                    matches.push(fullPath);
+                                }
+                            }
+                        }
+                    };
+                    searchDir(dirPath);
+                    result = { success: true, matches: matches.slice(0, 50) };
+                }
+                break;
+            }
+
+            default:
+                result = { success: false, error: `Unknown tool: ${name}` };
+        }
+    } catch (error) {
+        result = { success: false, error: error.message };
     }
+
+    return {
+        ...result,
+        executionTime: Date.now() - startTime
+    };
 }
 
 // ─────────────────────────────────────────────────────────────
-// Enhanced System Prompt
+// API Routes
 // ─────────────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `You are OpenAgent, a powerful AI assistant with access to local computer tools and web search capabilities.
 
-## Available Tools
-- **read_file**: Read contents of any file
-- **write_file**: Create or overwrite files
-- **edit_file**: Make targeted edits to files (search and replace)
-- **list_directory**: Explore folder contents
-- **create_directory**: Create new folders
-- **run_command**: Execute shell commands
-- **grep_search**: Search for text patterns across files
-- **search_web**: Search the internet for information
+// Health check
+app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
 
-## Guidelines
-1. Always use tools when the user requests file operations, commands, or information lookup
-2. For file edits, prefer edit_file over write_file when making small changes
-3. Be concise but thorough in your responses
-4. Explain what you're doing when using tools
-5. If a command fails, try to diagnose and suggest solutions
-6. Use grep_search to find relevant code before making edits
-7. Use search_web when you need current information or documentation
+// Get available Ollama models
+app.get('/api/models', async (req, res) => {
+    try {
+        const response = await ollama.list();
+        res.json({ models: response.models || [] });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to fetch models. Is Ollama running?' });
+    }
+});
 
-Be helpful, precise, and proactive in solving the user's problems.`;
+// Get conversations list
+app.get('/api/conversations', (req, res) => {
+    const list = Array.from(conversations.entries()).map(([id, conv]) => ({
+        id,
+        title: conv.title || 'New Chat',
+        createdAt: conv.createdAt,
+        updatedAt: conv.updatedAt,
+        messageCount: conv.messages.length
+    }));
+    res.json({ conversations: list.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)) });
+});
+
+// Get conversation by ID
+app.get('/api/conversations/:id', (req, res) => {
+    const conv = conversations.get(req.params.id);
+    if (!conv) {
+        return res.status(404).json({ error: 'Conversation not found' });
+    }
+    res.json(conv);
+});
+
+// Create new conversation
+app.post('/api/conversations', (req, res) => {
+    const id = `conv_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const conv = {
+        id,
+        title: 'New Chat',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        messages: []
+    };
+    conversations.set(id, conv);
+    res.json(conv);
+});
+
+// Delete conversation
+app.delete('/api/conversations/:id', (req, res) => {
+    conversations.delete(req.params.id);
+    res.json({ success: true });
+});
 
 // ─────────────────────────────────────────────────────────────
-// Chat endpoint (Single Agent Mode)
+// Chat endpoint with streaming (SSE)
 // ─────────────────────────────────────────────────────────────
-app.post('/chat', async (req, res) => {
-    const { messages, model } = req.body;
-    const selectedModel = model || config.defaultModel;
+app.post('/api/chat', async (req, res) => {
+    const { conversationId, message, model = 'llama3.2:latest' } = req.body;
 
-    // Set headers for streaming
+    // Set up SSE headers
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    const sendEvent = (type, data) => {
+        res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
+    };
 
     try {
-        let conversationMessages = [
-            { role: 'system', content: SYSTEM_PROMPT },
-            ...messages
+        // Get or create conversation
+        let conv = conversations.get(conversationId);
+        if (!conv) {
+            conv = {
+                id: conversationId || `conv_${Date.now()}`,
+                title: 'New Chat',
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                messages: []
+            };
+            conversations.set(conv.id, conv);
+        }
+
+        // Add user message
+        conv.messages.push({
+            role: 'user',
+            content: message,
+            timestamp: new Date().toISOString()
+        });
+
+        // Generate title from first message
+        if (conv.messages.length === 1) {
+            conv.title = message.substring(0, 50) + (message.length > 50 ? '...' : '');
+        }
+
+        // System prompt
+        const systemPrompt = `You are OpenAgent, a powerful AI assistant that can help with coding, file management, and system tasks.
+You have access to the following tools:
+- read_file: Read contents of a file
+- write_file: Write content to a file
+- list_directory: List contents of a directory
+- run_command: Execute shell commands
+- search_files: Search for files by pattern
+
+When you need to use a tool, you MUST respond with a tool call. Always explain what you're doing before using tools.
+Be helpful, concise, and proactive. If a task requires multiple steps, break it down clearly.`;
+
+        // Build messages for Ollama
+        const ollamaMessages = [
+            { role: 'system', content: systemPrompt },
+            ...conv.messages.map(m => ({ role: m.role, content: m.content }))
         ];
 
-        let continueLoop = true;
-        let iterations = 0;
-        const MAX_ITERATIONS = 10;
+        sendEvent('thinking', { status: 'Analyzing your request...' });
 
-        // Send thinking status
-        res.write(`data: ${JSON.stringify({ type: 'thinking', message: 'Analyzing your request...' })}\n\n`);
+        // Initial chat call with tools
+        let response = await ollama.chat({
+            model,
+            messages: ollamaMessages,
+            tools: TOOLS,
+            stream: false
+        });
 
-        while (continueLoop && iterations < MAX_ITERATIONS) {
-            iterations++;
+        let fullResponse = '';
+        let toolCalls = [];
 
-            const response = await ollamaClient.chat({
-                model: selectedModel,
-                messages: conversationMessages,
+        // Handle tool calls in a loop
+        while (response.message.tool_calls && response.message.tool_calls.length > 0) {
+            for (const toolCall of response.message.tool_calls) {
+                const toolName = toolCall.function.name;
+                const toolArgs = toolCall.function.arguments;
+
+                sendEvent('tool_start', {
+                    tool: toolName,
+                    args: toolArgs,
+                    status: 'Executing...'
+                });
+
+                const toolResult = await executeToolCall(toolName, toolArgs);
+
+                sendEvent('tool_complete', {
+                    tool: toolName,
+                    result: toolResult,
+                    executionTime: toolResult.executionTime
+                });
+
+                toolCalls.push({
+                    name: toolName,
+                    args: toolArgs,
+                    result: toolResult
+                });
+
+                // Add tool result to messages
+                ollamaMessages.push(response.message);
+                ollamaMessages.push({
+                    role: 'tool',
+                    content: JSON.stringify(toolResult)
+                });
+            }
+
+            // Continue the conversation with tool results
+            sendEvent('thinking', { status: 'Processing results...' });
+            response = await ollama.chat({
+                model,
+                messages: ollamaMessages,
                 tools: TOOLS,
                 stream: false
             });
+        }
 
-            const assistantMessage = response.message;
+        // Now stream the final response
+        sendEvent('streaming', { status: 'Generating response...' });
 
-            // Check for tool calls
-            if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
-                // Add assistant message with tool calls to conversation
-                conversationMessages.push(assistantMessage);
+        const streamResponse = await ollama.chat({
+            model,
+            messages: [...ollamaMessages, response.message],
+            stream: true
+        });
 
-                // Execute each tool call
-                for (const toolCall of assistantMessage.tool_calls) {
-                    const toolName = toolCall.function.name;
-                    const toolArgs = toolCall.function.arguments;
-
-                    // Send tool start event
-                    res.write(`data: ${JSON.stringify({
-                        type: 'tool_call',
-                        name: toolName,
-                        args: toolArgs
-                    })}\n\n`);
-
-                    const toolResult = await executeTool(toolName, toolArgs);
-
-                    // Send tool result event
-                    res.write(`data: ${JSON.stringify({
-                        type: 'tool_result',
-                        name: toolName,
-                        result: toolResult,
-                        success: toolResult.success !== false
-                    })}\n\n`);
-
-                    // Add tool result to conversation
-                    conversationMessages.push({
-                        role: 'tool',
-                        content: JSON.stringify(toolResult)
-                    });
-                }
-
-                // Send thinking status for next iteration
-                if (iterations < MAX_ITERATIONS) {
-                    res.write(`data: ${JSON.stringify({ type: 'thinking', message: 'Processing results...' })}\n\n`);
-                }
-            } else {
-                // No tool calls, send final response
-                res.write(`data: ${JSON.stringify({ type: 'message', content: assistantMessage.content })}\n\n`);
-                continueLoop = false;
+        for await (const chunk of streamResponse) {
+            if (chunk.message?.content) {
+                fullResponse += chunk.message.content;
+                sendEvent('token', { content: chunk.message.content });
             }
         }
 
-        res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
-        res.end();
-
-    } catch (error) {
-        res.write(`data: ${JSON.stringify({ type: 'error', message: error.message })}\n\n`);
-        res.end();
-    }
-});
-
-// ─────────────────────────────────────────────────────────────
-// Swarm Mode Chat endpoint
-// ─────────────────────────────────────────────────────────────
-const { SwarmOrchestrator } = require('./orchestrator');
-
-app.post('/chat/swarm', async (req, res) => {
-    const { message } = req.body;
-
-    // Set headers for streaming
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-
-    try {
-        const orchestrator = new SwarmOrchestrator(ollamaClient, config);
-
-        // Phase 1: Decompose
-        res.write(`data: ${JSON.stringify({ type: 'phase', phase: 'decomposing', message: 'Breaking down your request...' })}\n\n`);
-
-        const tasks = await orchestrator.decompose(message);
-
-        if (tasks.length === 0) {
-            res.write(`data: ${JSON.stringify({ type: 'error', message: 'Could not decompose task. Try single agent mode.' })}\n\n`);
-            res.end();
-            return;
+        // If no streaming happened, use the non-streamed response
+        if (!fullResponse && response.message.content) {
+            fullResponse = response.message.content;
+            sendEvent('token', { content: fullResponse });
         }
 
-        res.write(`data: ${JSON.stringify({ type: 'tasks', tasks })}\n\n`);
-
-        // Phase 2: Execute in parallel
-        res.write(`data: ${JSON.stringify({ type: 'phase', phase: 'executing', message: `Executing ${tasks.length} agents in parallel...` })}\n\n`);
-
-        const results = await orchestrator.executeSwarm(tasks, executeTool, (progress) => {
-            res.write(`data: ${JSON.stringify(progress)}\n\n`);
+        // Save assistant message
+        conv.messages.push({
+            role: 'assistant',
+            content: fullResponse,
+            toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+            timestamp: new Date().toISOString()
         });
 
-        // Phase 3: Synthesize
-        res.write(`data: ${JSON.stringify({ type: 'phase', phase: 'synthesizing', message: 'Summarizing results...' })}\n\n`);
+        conv.updatedAt = new Date().toISOString();
 
-        const summary = await orchestrator.synthesize(message, results);
-
-        res.write(`data: ${JSON.stringify({ type: 'message', content: summary })}\n\n`);
-        res.write(`data: ${JSON.stringify({ type: 'done', results })}\n\n`);
-        res.end();
+        sendEvent('complete', {
+            conversationId: conv.id,
+            messageId: `msg_${Date.now()}`
+        });
 
     } catch (error) {
-        res.write(`data: ${JSON.stringify({ type: 'error', message: error.message })}\n\n`);
-        res.end();
+        sendEvent('error', { message: error.message });
     }
+
+    res.end();
 });
 
 // ─────────────────────────────────────────────────────────────
-// Start server
+// Start Server
 // ─────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-    console.log(`✨ OpenAgent Backend running on http://localhost:${PORT}`);
-    console.log(`📦 Mode: ${config.mode}`);
-    console.log(`🤖 Default Model: ${config.defaultModel}`);
+server.listen(PORT, () => {
+    console.log(`🚀 OpenAgent Backend running on http://localhost:${PORT}`);
+    console.log(`📡 Ollama host: ${OLLAMA_HOST}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    server.close(() => {
+        console.log('Server closed');
+        process.exit(0);
+    });
 });
