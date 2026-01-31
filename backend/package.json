@@ -1,0 +1,26 @@
+{
+  "name": "swarmlocal-backend",
+  "version": "1.0.0",
+  "description": "SwarmLocal - Local AI Agent Hub with Single/Swarm modes",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "echo \"Tests coming soon\" && exit 0"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "ollama",
+    "local",
+    "swarm"
+  ],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "ollama": "^0.6.3"
+  }
+}
