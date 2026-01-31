@@ -5,7 +5,7 @@ const http = require('http');
 const path = require('path');
 const fs = require('fs');
 
-const { SwarmOrchestrator } = require('./orchestrator');
+const { webSearch, readUrl } = require('./tools/webSearch');
 const { runCommand } = require('./tools/terminal');
 
 // ─────────────────────────────────────────────────────────────
@@ -13,6 +13,7 @@ const { runCommand } = require('./tools/terminal');
 // ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://127.0.0.1:11434';
+const MAX_TOOL_ITERATIONS = 10;
 
 // Initialize Ollama client
 const ollama = new Ollama({ host: OLLAMA_HOST });
@@ -37,11 +38,11 @@ const TOOLS = [
         type: 'function',
         function: {
             name: 'read_file',
-            description: 'Read the contents of a file from the filesystem',
+            description: 'Read the contents of a file. Use this to view code, configuration, or text files.',
             parameters: {
                 type: 'object',
                 properties: {
-                    path: { type: 'string', description: 'Absolute or relative path to the file' }
+                    path: { type: 'string', description: 'Absolute or relative path to the file to read' }
                 },
                 required: ['path']
             }
@@ -51,12 +52,12 @@ const TOOLS = [
         type: 'function',
         function: {
             name: 'write_file',
-            description: 'Write content to a file on the filesystem',
+            description: 'Create a new file or completely overwrite an existing file with new content.',
             parameters: {
                 type: 'object',
                 properties: {
                     path: { type: 'string', description: 'Path to the file to write' },
-                    content: { type: 'string', description: 'Content to write to the file' }
+                    content: { type: 'string', description: 'Complete content to write to the file' }
                 },
                 required: ['path', 'content']
             }
@@ -65,8 +66,24 @@ const TOOLS = [
     {
         type: 'function',
         function: {
+            name: 'edit_file',
+            description: 'Edit a file by replacing specific text. Use this for precise modifications to existing files.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    path: { type: 'string', description: 'Path to the file to edit' },
+                    old_text: { type: 'string', description: 'Exact text to find and replace (must match exactly)' },
+                    new_text: { type: 'string', description: 'Text to replace the old text with' }
+                },
+                required: ['path', 'old_text', 'new_text']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
             name: 'list_directory',
-            description: 'List contents of a directory',
+            description: 'List all files and folders in a directory.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -79,8 +96,36 @@ const TOOLS = [
     {
         type: 'function',
         function: {
+            name: 'create_directory',
+            description: 'Create a new directory. Will create parent directories if needed.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    path: { type: 'string', description: 'Path of the directory to create' }
+                },
+                required: ['path']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'delete_file',
+            description: 'Delete a file from the filesystem.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    path: { type: 'string', description: 'Path to the file to delete' }
+                },
+                required: ['path']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
             name: 'run_command',
-            description: 'Execute a shell command. Use with caution.',
+            description: 'Execute a shell command. Returns stdout, stderr, and exit status.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -94,15 +139,59 @@ const TOOLS = [
     {
         type: 'function',
         function: {
+            name: 'grep_search',
+            description: 'Search for text patterns in files within a directory. Returns matching lines with file paths and line numbers.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    pattern: { type: 'string', description: 'Text pattern to search for' },
+                    directory: { type: 'string', description: 'Directory to search in' },
+                    file_pattern: { type: 'string', description: 'Glob pattern for files to search (e.g., "*.js", "*.py"). Default: all files' }
+                },
+                required: ['pattern', 'directory']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
             name: 'search_files',
-            description: 'Search for files matching a pattern in a directory',
+            description: 'Find files by name pattern in a directory. Returns list of matching file paths.',
             parameters: {
                 type: 'object',
                 properties: {
                     directory: { type: 'string', description: 'Directory to search in' },
-                    pattern: { type: 'string', description: 'Glob pattern to match (e.g., "*.js")' }
+                    pattern: { type: 'string', description: 'Glob pattern to match file names (e.g., "*.js", "package.json")' }
                 },
                 required: ['directory', 'pattern']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'web_search',
+            description: 'Search the web for information. Returns relevant search results with titles, URLs, and snippets.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    query: { type: 'string', description: 'Search query' }
+                },
+                required: ['query']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'read_url',
+            description: 'Read and extract text content from a webpage URL.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    url: { type: 'string', description: 'URL of the webpage to read' }
+                },
+                required: ['url']
             }
         }
     }
@@ -123,11 +212,13 @@ async function executeToolCall(name, args) {
                     result = { success: false, error: `File not found: ${filePath}` };
                 } else {
                     const stats = fs.statSync(filePath);
-                    if (stats.size > 1024 * 1024) {
-                        result = { success: false, error: 'File too large (>1MB)' };
+                    if (stats.isDirectory()) {
+                        result = { success: false, error: 'Path is a directory, use list_directory instead' };
+                    } else if (stats.size > 1024 * 1024) {
+                        result = { success: false, error: 'File too large (>1MB). Read specific sections instead.' };
                     } else {
                         const content = fs.readFileSync(filePath, 'utf-8');
-                        result = { success: true, content, size: stats.size };
+                        result = { success: true, content, path: filePath, size: stats.size };
                     }
                 }
                 break;
@@ -140,7 +231,33 @@ async function executeToolCall(name, args) {
                     fs.mkdirSync(dir, { recursive: true });
                 }
                 fs.writeFileSync(filePath, args.content, 'utf-8');
-                result = { success: true, path: filePath, bytesWritten: args.content.length };
+                result = { success: true, path: filePath, bytesWritten: args.content.length, message: `File written successfully` };
+                break;
+            }
+
+            case 'edit_file': {
+                const filePath = path.resolve(args.path);
+                if (!fs.existsSync(filePath)) {
+                    result = { success: false, error: `File not found: ${filePath}` };
+                } else {
+                    const content = fs.readFileSync(filePath, 'utf-8');
+                    if (!content.includes(args.old_text)) {
+                        result = { success: false, error: 'Old text not found in file. Make sure it matches exactly including whitespace.' };
+                    } else {
+                        const occurrences = (content.match(new RegExp(escapeRegExp(args.old_text), 'g')) || []).length;
+                        const newContent = content.replace(args.old_text, args.new_text);
+                        fs.writeFileSync(filePath, newContent, 'utf-8');
+                        result = {
+                            success: true,
+                            path: filePath,
+                            message: `Replaced ${occurrences} occurrence(s)`,
+                            diff: {
+                                removed: args.old_text.split('\n').slice(0, 5),
+                                added: args.new_text.split('\n').slice(0, 5)
+                            }
+                        };
+                    }
+                }
                 break;
             }
 
@@ -148,14 +265,38 @@ async function executeToolCall(name, args) {
                 const dirPath = path.resolve(args.path);
                 if (!fs.existsSync(dirPath)) {
                     result = { success: false, error: `Directory not found: ${dirPath}` };
+                } else if (!fs.statSync(dirPath).isDirectory()) {
+                    result = { success: false, error: 'Path is not a directory' };
                 } else {
                     const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-                    const items = entries.map(entry => ({
-                        name: entry.name,
-                        type: entry.isDirectory() ? 'directory' : 'file',
-                        path: path.join(dirPath, entry.name)
-                    }));
-                    result = { success: true, path: dirPath, items };
+                    const items = entries
+                        .filter(e => !e.name.startsWith('.'))
+                        .slice(0, 50)
+                        .map(entry => ({
+                            name: entry.name,
+                            type: entry.isDirectory() ? 'directory' : 'file'
+                        }));
+                    result = { success: true, path: dirPath, items, totalItems: entries.length };
+                }
+                break;
+            }
+
+            case 'create_directory': {
+                const dirPath = path.resolve(args.path);
+                fs.mkdirSync(dirPath, { recursive: true });
+                result = { success: true, path: dirPath, message: 'Directory created' };
+                break;
+            }
+
+            case 'delete_file': {
+                const filePath = path.resolve(args.path);
+                if (!fs.existsSync(filePath)) {
+                    result = { success: false, error: `File not found: ${filePath}` };
+                } else if (fs.statSync(filePath).isDirectory()) {
+                    result = { success: false, error: 'Cannot delete directory with this tool. Use run_command with rm -r instead.' };
+                } else {
+                    fs.unlinkSync(filePath);
+                    result = { success: true, path: filePath, message: 'File deleted' };
                 }
                 break;
             }
@@ -165,33 +306,97 @@ async function executeToolCall(name, args) {
                 break;
             }
 
-            case 'search_files': {
-                const { directory, pattern } = args;
+            case 'grep_search': {
+                const { pattern, directory, file_pattern } = args;
                 const dirPath = path.resolve(directory);
                 if (!fs.existsSync(dirPath)) {
                     result = { success: false, error: `Directory not found: ${dirPath}` };
                 } else {
-                    // Simple glob matching
                     const matches = [];
                     const searchDir = (dir, depth = 0) => {
-                        if (depth > 5) return; // Limit depth
-                        const entries = fs.readdirSync(dir, { withFileTypes: true });
-                        for (const entry of entries) {
-                            const fullPath = path.join(dir, entry.name);
-                            if (entry.isDirectory() && !entry.name.startsWith('.')) {
-                                searchDir(fullPath, depth + 1);
-                            } else if (entry.isFile()) {
-                                // Simple pattern matching
-                                const regex = new RegExp(pattern.replace(/\*/g, '.*').replace(/\?/g, '.'));
-                                if (regex.test(entry.name)) {
-                                    matches.push(fullPath);
+                        if (depth > 5 || matches.length >= 50) return;
+                        try {
+                            const entries = fs.readdirSync(dir, { withFileTypes: true });
+                            for (const entry of entries) {
+                                if (matches.length >= 50) break;
+                                if (entry.name.startsWith('.') || ['node_modules', 'dist', 'build', '.git'].includes(entry.name)) continue;
+
+                                const fullPath = path.join(dir, entry.name);
+                                if (entry.isDirectory()) {
+                                    searchDir(fullPath, depth + 1);
+                                } else if (entry.isFile()) {
+                                    // Check file pattern
+                                    if (file_pattern) {
+                                        const regex = new RegExp(file_pattern.replace(/\*/g, '.*').replace(/\?/g, '.'));
+                                        if (!regex.test(entry.name)) continue;
+                                    }
+                                    try {
+                                        const content = fs.readFileSync(fullPath, 'utf-8');
+                                        const lines = content.split('\n');
+                                        lines.forEach((line, idx) => {
+                                            if (line.toLowerCase().includes(pattern.toLowerCase()) && matches.length < 50) {
+                                                matches.push({
+                                                    file: fullPath,
+                                                    line: idx + 1,
+                                                    content: line.trim().slice(0, 200)
+                                                });
+                                            }
+                                        });
+                                    } catch (e) {
+                                        // Skip binary files
+                                    }
                                 }
                             }
+                        } catch (e) {
+                            // Skip inaccessible directories
                         }
                     };
                     searchDir(dirPath);
-                    result = { success: true, matches: matches.slice(0, 50) };
+                    result = { success: true, pattern, directory: dirPath, matches, matchCount: matches.length };
                 }
+                break;
+            }
+
+            case 'search_files': {
+                const { directory, pattern: filePattern } = args;
+                const dirPath = path.resolve(directory);
+                if (!fs.existsSync(dirPath)) {
+                    result = { success: false, error: `Directory not found: ${dirPath}` };
+                } else {
+                    const matches = [];
+                    const searchDir = (dir, depth = 0) => {
+                        if (depth > 5 || matches.length >= 50) return;
+                        try {
+                            const entries = fs.readdirSync(dir, { withFileTypes: true });
+                            const regex = new RegExp(filePattern.replace(/\./g, '\\.').replace(/\*/g, '.*').replace(/\?/g, '.'), 'i');
+                            for (const entry of entries) {
+                                if (matches.length >= 50) break;
+                                if (entry.name.startsWith('.') || ['node_modules', 'dist', 'build', '.git'].includes(entry.name)) continue;
+
+                                const fullPath = path.join(dir, entry.name);
+                                if (entry.isDirectory()) {
+                                    searchDir(fullPath, depth + 1);
+                                } else if (regex.test(entry.name)) {
+                                    matches.push(fullPath);
+                                }
+                            }
+                        } catch (e) {
+                            // Skip inaccessible directories
+                        }
+                    };
+                    searchDir(dirPath);
+                    result = { success: true, pattern: filePattern, directory: dirPath, matches };
+                }
+                break;
+            }
+
+            case 'web_search': {
+                result = await webSearch(args.query, 5);
+                break;
+            }
+
+            case 'read_url': {
+                result = await readUrl(args.url);
                 break;
             }
 
@@ -207,6 +412,43 @@ async function executeToolCall(name, args) {
         executionTime: Date.now() - startTime
     };
 }
+
+function escapeRegExp(string) {
+    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ─────────────────────────────────────────────────────────────
+// System Prompt - Optimized for agent behavior
+// ─────────────────────────────────────────────────────────────
+const SYSTEM_PROMPT = `You are OpenAgent, a powerful AI assistant that can interact with the user's computer to help with coding, file management, and research tasks.
+
+## Your Capabilities
+You have access to these tools:
+- **read_file**: Read file contents
+- **write_file**: Create or overwrite files
+- **edit_file**: Modify specific parts of files (find and replace)
+- **list_directory**: List directory contents
+- **create_directory**: Create folders
+- **delete_file**: Delete files
+- **run_command**: Execute shell commands
+- **grep_search**: Search for text patterns in code
+- **search_files**: Find files by name
+- **web_search**: Search the internet
+- **read_url**: Read webpage content
+
+## Guidelines
+1. **Use tools proactively** - When a task requires file access or commands, use tools immediately
+2. **Be thorough** - When editing code, read the file first to understand context
+3. **Chain operations** - Complex tasks may require multiple tool calls in sequence
+4. **Explain your actions** - Briefly describe what you're doing and why
+5. **Handle errors gracefully** - If a tool fails, try an alternative approach
+6. **Be precise with edits** - When using edit_file, match the exact text including whitespace
+
+## Best Practices
+- Always read a file before editing it
+- Use grep_search to find where code is defined before making changes
+- After writing files, consider running tests or build commands
+- For web research, search first then read specific URLs for details`;
 
 // ─────────────────────────────────────────────────────────────
 // API Routes
@@ -310,21 +552,9 @@ app.post('/api/chat', async (req, res) => {
             conv.title = message.substring(0, 50) + (message.length > 50 ? '...' : '');
         }
 
-        // System prompt
-        const systemPrompt = `You are OpenAgent, a powerful AI assistant that can help with coding, file management, and system tasks.
-You have access to the following tools:
-- read_file: Read contents of a file
-- write_file: Write content to a file
-- list_directory: List contents of a directory
-- run_command: Execute shell commands
-- search_files: Search for files by pattern
-
-When you need to use a tool, you MUST respond with a tool call. Always explain what you're doing before using tools.
-Be helpful, concise, and proactive. If a task requires multiple steps, break it down clearly.`;
-
         // Build messages for Ollama
         const ollamaMessages = [
-            { role: 'system', content: systemPrompt },
+            { role: 'system', content: SYSTEM_PROMPT },
             ...conv.messages.map(m => ({ role: m.role, content: m.content }))
         ];
 
@@ -340,9 +570,12 @@ Be helpful, concise, and proactive. If a task requires multiple steps, break it 
 
         let fullResponse = '';
         let toolCalls = [];
+        let iterations = 0;
 
-        // Handle tool calls in a loop
-        while (response.message.tool_calls && response.message.tool_calls.length > 0) {
+        // Handle tool calls in a loop (with max iterations to prevent infinite loops)
+        while (response.message.tool_calls && response.message.tool_calls.length > 0 && iterations < MAX_TOOL_ITERATIONS) {
+            iterations++;
+
             for (const toolCall of response.message.tool_calls) {
                 const toolName = toolCall.function.name;
                 const toolArgs = toolCall.function.arguments;
@@ -376,7 +609,7 @@ Be helpful, concise, and proactive. If a task requires multiple steps, break it 
             }
 
             // Continue the conversation with tool results
-            sendEvent('thinking', { status: 'Processing results...' });
+            sendEvent('thinking', { status: `Processing results... (step ${iterations})` });
             response = await ollama.chat({
                 model,
                 messages: ollamaMessages,
@@ -388,9 +621,15 @@ Be helpful, concise, and proactive. If a task requires multiple steps, break it 
         // Now stream the final response
         sendEvent('streaming', { status: 'Generating response...' });
 
+        // Add the final assistant message to get a streaming response
+        const finalMessages = [...ollamaMessages];
+        if (response.message.content) {
+            finalMessages.push(response.message);
+        }
+
         const streamResponse = await ollama.chat({
             model,
-            messages: [...ollamaMessages, response.message],
+            messages: finalMessages,
             stream: true
         });
 
@@ -423,6 +662,7 @@ Be helpful, concise, and proactive. If a task requires multiple steps, break it 
         });
 
     } catch (error) {
+        console.error('Chat error:', error);
         sendEvent('error', { message: error.message });
     }
 
@@ -433,8 +673,9 @@ Be helpful, concise, and proactive. If a task requires multiple steps, break it 
 // Start Server
 // ─────────────────────────────────────────────────────────────
 server.listen(PORT, () => {
-    console.log(`🚀 OpenAgent Backend running on http://localhost:${PORT}`);
-    console.log(`📡 Ollama host: ${OLLAMA_HOST}`);
+    console.log(`OpenAgent Backend running on http://localhost:${PORT}`);
+    console.log(`Ollama host: ${OLLAMA_HOST}`);
+    console.log(`Tools available: ${TOOLS.map(t => t.function.name).join(', ')}`);
 });
 
 // Graceful shutdown
