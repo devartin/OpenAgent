@@ -1,7 +1,8 @@
-const { app, BrowserWindow, shell } = require('electron');
+const { app, BrowserWindow, shell, dialog } = require('electron');
 const path = require('path');
 const { spawn, execSync } = require('child_process');
 const fs = require('fs');
+const http = require('http');
 
 // ─────────────────────────────────────────────────────────────
 // Single Instance Lock - Prevent multiple app instances
@@ -20,7 +21,43 @@ const BACKEND_PORT = 3001;
 const FRONTEND_DEV_PORT = 3002;
 
 // ─────────────────────────────────────────────────────────────
-// Find System Node.js (NOT Electron binary)
+// Get Resource Paths (Production vs Development)
+// ─────────────────────────────────────────────────────────────
+function getResourcePath(...segments) {
+    if (isDev) {
+        return path.join(__dirname, '..', ...segments);
+    }
+    // In production: resources are in app.asar or unpacked alongside
+    // Since asar is disabled, files are directly in the app directory
+    return path.join(process.resourcesPath, '..', ...segments);
+}
+
+function getAppPath() {
+    if (isDev) {
+        return path.join(__dirname, '..');
+    }
+    // Production: app contents are in Resources/app
+    return path.join(process.resourcesPath, 'app');
+}
+
+function getBackendPath() {
+    if (isDev) {
+        return path.join(__dirname, '..', 'backend');
+    }
+    // Production: backend is in Resources/app/backend
+    return path.join(process.resourcesPath, 'app', 'backend');
+}
+
+function getBackendNodeModulesPath() {
+    if (isDev) {
+        return path.join(__dirname, '..', 'backend', 'node_modules');
+    }
+    // Production: extraResources copies node_modules to Resources/backend/node_modules
+    return path.join(process.resourcesPath, 'backend', 'node_modules');
+}
+
+// ─────────────────────────────────────────────────────────────
+// Find System Node.js
 // ─────────────────────────────────────────────────────────────
 function findNodePath() {
     const possiblePaths = [
@@ -32,6 +69,7 @@ function findNodePath() {
 
     for (const nodePath of possiblePaths) {
         if (fs.existsSync(nodePath)) {
+            console.log('Found Node.js at:', nodePath);
             return nodePath;
         }
     }
@@ -41,24 +79,46 @@ function findNodePath() {
         const cmd = process.platform === 'win32' ? 'where node' : 'which node';
         const result = execSync(cmd, { encoding: 'utf8', timeout: 5000 }).trim();
         if (result && fs.existsSync(result.split('\n')[0])) {
+            console.log('Found Node.js via PATH:', result.split('\n')[0]);
             return result.split('\n')[0];
         }
     } catch (e) {
-        // Ignore
+        console.log('Could not find Node.js via PATH');
     }
 
-    return 'node'; // Last resort - hope it's in PATH
+    return null;
 }
 
 // ─────────────────────────────────────────────────────────────
-// Get Resource Paths
+// Check if backend is running
 // ─────────────────────────────────────────────────────────────
-function getAppPath() {
-    if (isDev) {
-        return path.join(__dirname, '..');
+function checkBackendHealth() {
+    return new Promise((resolve) => {
+        const req = http.get(`http://localhost:${BACKEND_PORT}/api/health`, (res) => {
+            resolve(res.statusCode === 200);
+        });
+        req.on('error', () => resolve(false));
+        req.setTimeout(1000, () => {
+            req.destroy();
+            resolve(false);
+        });
+    });
+}
+
+// ─────────────────────────────────────────────────────────────
+// Wait for backend to be ready
+// ─────────────────────────────────────────────────────────────
+async function waitForBackend(maxAttempts = 30) {
+    for (let i = 0; i < maxAttempts; i++) {
+        const isReady = await checkBackendHealth();
+        if (isReady) {
+            console.log('Backend is ready!');
+            return true;
+        }
+        await new Promise(resolve => setTimeout(resolve, 500));
     }
-    // In production packaged app
-    return path.join(__dirname, '..');
+    console.log('Backend did not start in time');
+    return false;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -78,14 +138,13 @@ function createWindow() {
         titleBarStyle: 'hiddenInset',
         trafficLightPosition: { x: 16, y: 16 },
         backgroundColor: '#09090b',
-        show: false, // Don't show until ready
+        show: false,
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
         }
     });
 
-    // Show when ready to prevent white flash
     mainWindow.once('ready-to-show', () => {
         mainWindow.show();
     });
@@ -95,13 +154,29 @@ function createWindow() {
         mainWindow.webContents.openDevTools({ mode: 'detach' });
     } else {
         // Production: Load static HTML from frontend/out
-        const htmlPath = path.join(getAppPath(), 'frontend', 'out', 'index.html');
+        const appDir = getAppPath();
+        const htmlPath = path.join(appDir, 'frontend', 'out', 'index.html');
+
+        console.log('Loading frontend from:', htmlPath);
+        console.log('App directory:', appDir);
 
         if (fs.existsSync(htmlPath)) {
             mainWindow.loadFile(htmlPath);
         } else {
-            // Fallback error display
-            mainWindow.loadURL(`data:text/html,<html><body style="background:#09090b;color:#fff;font-family:system-ui;padding:40px;"><h1>OpenAgent</h1><p>Error: Frontend not found at ${htmlPath}</p><p>Please reinstall the application.</p></body></html>`);
+            // Show error with diagnostic info
+            const errorHtml = `
+                <html>
+                <body style="background:#09090b;color:#fff;font-family:system-ui;padding:40px;">
+                    <h1>OpenAgent</h1>
+                    <p style="color:#ff6b6b;">Error: Frontend not found</p>
+                    <p style="color:#888;font-size:12px;">Expected at: ${htmlPath}</p>
+                    <p style="color:#888;font-size:12px;">App dir: ${appDir}</p>
+                    <p style="color:#888;font-size:12px;">Resources: ${process.resourcesPath}</p>
+                    <p style="margin-top:20px;">Please reinstall the application.</p>
+                </body>
+                </html>
+            `;
+            mainWindow.loadURL(`data:text/html,${encodeURIComponent(errorHtml)}`);
         }
     }
 
@@ -122,36 +197,68 @@ function createWindow() {
 // ─────────────────────────────────────────────────────────────
 // Start Backend Server
 // ─────────────────────────────────────────────────────────────
-function startBackend() {
+async function startBackend() {
     if (isDev) {
-        // In dev mode, backend should be started separately
-        return;
+        // In dev mode, backend started separately
+        return true;
     }
 
     if (backendProcess) {
-        return; // Already running
+        return true;
     }
 
     const nodePath = findNodePath();
-    const backendDir = path.join(getAppPath(), 'backend');
+    if (!nodePath) {
+        dialog.showErrorBox(
+            'Node.js Required',
+            'OpenAgent requires Node.js to be installed.\n\nPlease install Node.js from https://nodejs.org and restart the application.'
+        );
+        app.quit();
+        return false;
+    }
+
+    const backendDir = getBackendPath();
     const serverPath = path.join(backendDir, 'src', 'server.js');
+    const nodeModulesPath = getBackendNodeModulesPath();
+
+    console.log('Starting backend...');
+    console.log('  Node path:', nodePath);
+    console.log('  Backend dir:', backendDir);
+    console.log('  Server path:', serverPath);
+    console.log('  Node modules:', nodeModulesPath);
 
     if (!fs.existsSync(serverPath)) {
         console.error('Backend server.js not found at:', serverPath);
-        return;
+        dialog.showErrorBox(
+            'Backend Not Found',
+            `Could not find the backend server.\n\nExpected at: ${serverPath}\n\nPlease reinstall the application.`
+        );
+        return false;
     }
 
     try {
+        // Set NODE_PATH so require() can find modules from extraResources
+        const env = {
+            ...process.env,
+            PORT: String(BACKEND_PORT),
+            NODE_ENV: 'production',
+            NODE_PATH: nodeModulesPath
+        };
+
         backendProcess = spawn(nodePath, [serverPath], {
-            env: {
-                ...process.env,
-                PORT: String(BACKEND_PORT),
-                NODE_ENV: 'production'
-            },
+            env,
             cwd: backendDir,
-            stdio: ['ignore', 'ignore', 'ignore'], // Silent - no pipes to avoid EPIPE
+            stdio: ['ignore', 'pipe', 'pipe'],
             detached: false,
             windowsHide: true
+        });
+
+        backendProcess.stdout.on('data', (data) => {
+            console.log('[Backend]', data.toString().trim());
+        });
+
+        backendProcess.stderr.on('data', (data) => {
+            console.error('[Backend Error]', data.toString().trim());
         });
 
         backendProcess.on('error', (err) => {
@@ -160,12 +267,18 @@ function startBackend() {
         });
 
         backendProcess.on('exit', (code) => {
+            console.log('Backend exited with code:', code);
             backendProcess = null;
         });
+
+        // Wait for backend to be ready
+        const isReady = await waitForBackend();
+        return isReady;
 
     } catch (err) {
         console.error('Failed to start backend:', err.message);
         backendProcess = null;
+        return false;
     }
 }
 
@@ -198,13 +311,19 @@ app.on('second-instance', () => {
 });
 
 // App ready
-app.whenReady().then(() => {
-    // Start backend first
-    startBackend();
+app.whenReady().then(async () => {
+    console.log('App ready. isDev:', isDev);
+    console.log('Resources path:', process.resourcesPath);
 
-    // Wait for backend to initialize, then create window
-    const delay = isDev ? 0 : 2500;
-    setTimeout(createWindow, delay);
+    // Start backend first
+    const backendStarted = await startBackend();
+
+    if (!backendStarted && !isDev) {
+        // Show warning but continue - user might have backend running externally
+        console.warn('Backend may not have started, continuing anyway...');
+    }
+
+    createWindow();
 
     // macOS: Recreate window when dock icon clicked
     app.on('activate', () => {
