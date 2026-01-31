@@ -2,7 +2,7 @@
 
 **Local AI Agent for your computer**
 
-A desktop application that acts as your personal AI agent, capable of reading/writing files, running terminal commands, and automating tasks on your local machine using Ollama.
+A powerful desktop application that acts as your personal AI agent, capable of reading/writing files, running terminal commands, searching the web, and automating tasks on your local machine using Ollama.
 
 ## Download
 
@@ -28,11 +28,34 @@ A desktop application that acts as your personal AI agent, capable of reading/wr
 
 ## Features
 
-- **Single Agent Mode** — Sequential task execution
-- **Swarm Mode** — Parallel multi-agent orchestration
-- **Built-in Tools** — File read/write, directory listing, terminal commands
-- **Safety Gates** — Dangerous commands blocked automatically
-- **Professional UI** — Dark theme with real-time agent visualization
+### 🤖 Agentic Capabilities
+- **read_file** — Read any file's contents
+- **write_file** — Create or overwrite files
+- **edit_file** — Make targeted edits (search & replace)
+- **list_directory** — Explore folder contents
+- **create_directory** — Create new folders
+- **run_command** — Execute shell commands
+- **grep_search** — Search for text across files
+- **search_web** — Search the internet for information
+
+### 🎯 Modes
+- **Single Agent Mode** — Sequential task execution with full tool access
+- **Swarm Mode** — Parallel multi-agent orchestration for complex tasks
+
+### 🛡️ Safety
+- Dangerous commands are automatically blocked
+- Safety gates prevent destructive operations
+
+### ✨ Premium UI
+- Modern glassmorphism design
+- Real-time agent activity visualization
+- Streaming responses with thinking indicators
+- Collapsible tool execution cards
+- Dark theme optimized for extended use
+
+## Screenshots
+
+*Coming soon*
 
 ## Development
 
@@ -41,27 +64,41 @@ A desktop application that acts as your personal AI agent, capable of reading/wr
 git clone https://github.com/devartin/OpenAgent.git
 cd OpenAgent
 
-# Install dependencies
+# Install all dependencies
 npm install
 cd backend && npm install
 cd ../frontend && npm install
+cd ..
 
-# Start development servers
+# Start development (all services)
+npm run dev
+
+# Or run individually:
 # Terminal 1: Backend
 cd backend && npm run dev
 
 # Terminal 2: Frontend
 cd frontend && npm run dev
 
-# Terminal 3 (optional): Electron
+# Terminal 3: Electron
 npm run dev:electron
 ```
 
 ### Build Distribution
 
 ```bash
+# Build frontend and package Electron app
 npm run build
 ```
+
+Output will be in the `dist/` folder.
+
+## Tech Stack
+
+- **Frontend**: Next.js 16, React
+- **Backend**: Express.js, Ollama SDK
+- **Desktop**: Electron
+- **AI**: Ollama (local LLMs)
 
 ## License
 
