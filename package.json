@@ -45,14 +45,16 @@
         ],
         "mac": {
             "category": "public.app-category.developer-tools",
-            "icon": "assets/icon.icns",
+            "icon": "assets/icons/icon.icns",
+            "hardenedRuntime": false,
+            "gatekeeperAssess": false,
             "target": [
                 "dmg",
                 "zip"
             ]
         },
         "win": {
-            "icon": "assets/icon.ico",
+            "icon": "assets/icons/icon.ico",
             "target": [
                 "nsis",
                 "portable"
@@ -60,11 +62,12 @@
         },
         "linux": {
             "category": "Development",
-            "icon": "assets/icon.png",
+            "icon": "assets/icons/icon.png",
             "target": [
                 "AppImage",
                 "deb"
             ]
-        }
+        },
+        "asar": false
     }
 }
