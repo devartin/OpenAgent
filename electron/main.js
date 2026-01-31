@@ -1,21 +1,46 @@
 const { app, BrowserWindow, shell } = require('electron');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
+const fs = require('fs');
+
+// Prevent multiple instances
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+    app.quit();
+    process.exit(0);
+}
 
 let mainWindow;
 let backendProcess;
 
 const isDev = process.env.NODE_ENV === 'development';
-const FRONTEND_PORT = 3002;
 const BACKEND_PORT = 3001;
 
-// Get the correct base path for resources
-function getResourcePath(relativePath) {
-    if (isDev) {
-        return path.join(__dirname, '..', relativePath);
+// Find system Node.js installation
+function findNodePath() {
+    try {
+        // Try common locations
+        const commonPaths = [
+            '/usr/local/bin/node',
+            '/opt/homebrew/bin/node',
+            '/usr/bin/node'
+        ];
+
+        for (const nodePath of commonPaths) {
+            if (fs.existsSync(nodePath)) {
+                return nodePath;
+            }
+        }
+
+        // Try which node
+        const result = execSync('which node', { encoding: 'utf8' }).trim();
+        if (result && fs.existsSync(result)) {
+            return result;
+        }
+    } catch (e) {
+        // Fallback
     }
-    // In production, resources are in the app's resource folder
-    return path.join(process.resourcesPath, relativePath);
+    return 'node'; // Hope it's in PATH
 }
 
 function createWindow() {
@@ -33,18 +58,15 @@ function createWindow() {
         }
     });
 
-    // Load the app
     if (isDev) {
-        mainWindow.loadURL(`http://localhost:${FRONTEND_PORT}`);
+        mainWindow.loadURL('http://localhost:3002');
         mainWindow.webContents.openDevTools({ mode: 'detach' });
     } else {
         // Production: Load from built Next.js export
         const frontendPath = path.join(__dirname, '..', 'frontend', 'out', 'index.html');
-        console.log('Loading frontend from:', frontendPath);
         mainWindow.loadFile(frontendPath);
     }
 
-    // Handle external links
     mainWindow.webContents.setWindowOpenHandler(({ url }) => {
         if (url.startsWith('http')) {
             shell.openExternal(url);
@@ -60,51 +82,71 @@ function createWindow() {
 
 function startBackend() {
     if (isDev) {
-        // In dev mode, assume backend is started separately
-        console.log('Dev mode: Backend should be started separately');
-        return;
+        return; // Backend started separately in dev
     }
 
-    // Production: Start the bundled backend
-    const backendPath = path.join(__dirname, '..', 'backend', 'src', 'server.js');
-    console.log('Starting backend from:', backendPath);
-
-    backendProcess = spawn(process.execPath.includes('Electron') ? 'node' : process.execPath, [backendPath], {
-        env: { ...process.env, PORT: BACKEND_PORT, NODE_ENV: 'production' },
-        stdio: 'pipe',
-        cwd: path.join(__dirname, '..', 'backend')
-    });
-
-    backendProcess.stdout.on('data', (data) => {
-        console.log(`Backend: ${data}`);
-    });
-
-    backendProcess.stderr.on('data', (data) => {
-        console.error(`Backend Error: ${data}`);
-    });
-
-    backendProcess.on('error', (err) => {
-        console.error('Failed to start backend:', err);
-    });
-
-    backendProcess.on('exit', (code) => {
-        console.log(`Backend exited with code ${code}`);
-    });
-}
-
-function stopBackend() {
     if (backendProcess) {
-        console.log('Stopping backend...');
-        backendProcess.kill();
+        return; // Already running
+    }
+
+    const backendPath = path.join(__dirname, '..', 'backend', 'src', 'server.js');
+    const nodePath = findNodePath();
+    const backendCwd = path.join(__dirname, '..', 'backend');
+
+    try {
+        backendProcess = spawn(nodePath, [backendPath], {
+            env: {
+                ...process.env,
+                PORT: String(BACKEND_PORT),
+                NODE_ENV: 'production'
+            },
+            stdio: ['ignore', 'pipe', 'pipe'],
+            cwd: backendCwd,
+            detached: false
+        });
+
+        // Silently handle output to avoid EPIPE errors
+        if (backendProcess.stdout) {
+            backendProcess.stdout.on('data', () => { });
+            backendProcess.stdout.on('error', () => { });
+        }
+        if (backendProcess.stderr) {
+            backendProcess.stderr.on('data', () => { });
+            backendProcess.stderr.on('error', () => { });
+        }
+
+        backendProcess.on('error', () => { });
+        backendProcess.on('exit', () => {
+            backendProcess = null;
+        });
+
+    } catch (err) {
         backendProcess = null;
     }
 }
 
+function stopBackend() {
+    if (backendProcess) {
+        try {
+            backendProcess.kill('SIGTERM');
+        } catch (e) { }
+        backendProcess = null;
+    }
+}
+
+// Handle second instance
+app.on('second-instance', () => {
+    if (mainWindow) {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.focus();
+    }
+});
+
 app.whenReady().then(() => {
     startBackend();
 
-    // Delay to let backend start
-    setTimeout(createWindow, isDev ? 0 : 1500);
+    // Wait for backend to start
+    setTimeout(createWindow, isDev ? 0 : 2000);
 
     app.on('activate', () => {
         if (BrowserWindow.getAllWindows().length === 0) {
@@ -123,3 +165,6 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
     stopBackend();
 });
+
+// Catch uncaught exceptions to prevent crash dialogs
+process.on('uncaughtException', () => { });
